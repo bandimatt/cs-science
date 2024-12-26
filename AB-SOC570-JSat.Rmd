@@ -1,0 +1,628 @@
+---
+title: "AB-SOC570-JSat"
+author: "Aditya Bandimatt"
+date: "2024-12-15"
+output: html_document
+---
+
+### Setup and Load libraries
+
+```{r setup, echo=TRUE}
+# Set the CRAN mirror
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("corrplot")
+install.packages("nortest")
+library(nortest)
+library(corrplot)
+library(dplyr)
+library(stringr)
+library(lmtest)
+library(car)
+library(Hmisc)
+library(nortest)
+```
+
+### Read dataset
+
+```{r label=readdata}
+# Set working directory
+setwd(paste0("C:/Users/ual-laptop/OneDrive/04. Bandimatt_GL-UoA/",
+      "00. Oncampus_Fall_2024/SOC_570A_StatsForSocialScience/",
+      "Assignment-Final/data"))
+
+# Read GSS job satisfaction data
+# Pre filtered by year, full response for predictor variable questions
+# Source: https://gss.norc.org/
+djsat <- read.csv("gss_jsat_7416.csv")
+ 
+# Read DLS unemployment data
+# Source: https://www.bls.gov/data/
+dunemp <- read.csv("dls_uempdata.csv")
+
+# Read trading unemployment data
+# Source: https://www.investopedia.com/historical-us-unemployment-rate-by-year# -7495494
+inv_dunemp <- read.csv("inv_uempdata.csv")
+
+# Print summary for job satisfaction dataframe
+summary(djsat)
+
+# Print summary for job unemployment dataframe
+summary(dunemp)
+
+# Print summary for job unemployment dataframe (investopedia)
+summary(inv_dunemp)
+
+nrow(djsat)
+
+```
+
+```{r}
+# View data for reference 
+# View(djsat)
+# View(dunemp)
+# View(inv_dunemp)
+```
+
+### Merge GSS and DLS datasets
+```{r}
+# Bring over unemployment rates for each year to the dataframe
+unemp_selected <- dunemp[, c("year", "unempp")]
+
+# Merge the dataframes based on the 'year' column
+djsat <- merge(djsat, unemp_selected, by = "year", all.x = TRUE)
+
+# Bring over unemployment rates for each year to the dataframe (Investopedia)
+inv_unemp_selected <- inv_dunemp[, c("year", "inv_unempp")]
+
+# Merge the dataframes based on the 'year' column
+djsat <- merge(djsat, inv_unemp_selected, by = "year", all.x = TRUE)
+
+```
+
+### Feature Engineering
+```{r}
+# Create a function to extract the minimum and maximum income values
+extract_income <- function(income_range) {
+  # Remove the $ sign and commas, and standardize the text
+  income_range <- gsub("\\$", "", income_range)
+  income_range <- gsub(",", "", income_range)
+  income_range <- tolower(income_range)
+  
+  if (grepl("or more", income_range)) {
+    # Handle the "or more" case
+    incomemin <- as.numeric(gsub(" or more", "", income_range))
+    incomemax <- NA
+  } else if (grepl("under|less than|lt", income_range)) {
+    # Handle the "Under" or "Less than" case
+    incomemin <- 0
+    incomemax <- as.numeric(gsub("under |less than |lt ", "", income_range))
+  } else {
+    # Handle the regular range case with "to"
+    income_parts <- unlist(strsplit(income_range, " to "))
+    if (length(income_parts) == 2) {
+      incomemin <- as.numeric(income_parts[1])
+      incomemax <- as.numeric(income_parts[2])
+    } else {
+      # Handle possible single value case
+      incomemin <- as.numeric(income_parts[1])
+      incomemax <- NA
+    }
+  }
+  
+  return(c(incomemin, incomemax))
+}
+
+```
+
+```{r}
+# Apply the function to the 'income' column and create new columns
+income_values <- t(sapply(djsat$income, extract_income))
+djsat$incomemin <- income_values[, 1]
+djsat$incomemax <- income_values[, 2]
+
+# Impute NA with 0 to make sure averages are calculated correctly
+djsat <- djsat |>
+         mutate( incomemin = ifelse(is.na(incomemin),
+                                    0, incomemin),
+                 incomemax = ifelse(is.na(incomemax),
+                                    0, incomemax))
+
+
+# Calculate average income from the income range
+djsat <- djsat |>
+      mutate(afincome = (incomemin + incomemax) / 2)
+
+```
+
+
+
+```{r}
+# Add Age square and logs for income columns
+djsat <- djsat |> mutate(agesq = age*2,
+                         log_afincome = log(afincome))
+
+```
+```{r}
+# Add log of incomemin
+djsat <- djsat |>
+         mutate(log_incomemin = log(ifelse(incomemin == 0, 1, incomemin)))
+```
+
+
+```{r}
+# Convert gender column values to title case
+djsat <- djsat %>% mutate(sex = str_to_title(sex))
+
+```
+
+
+```{r}
+# Encode job satisfaction
+djsat$satjob_encoded <- as.numeric(factor(djsat$satjob,
+                                          levels = c("Very dissatisfied",
+                                                     "A little dissatisfied",
+                                                     "Moderately satisfied",
+                                                     "Very satisfied"),
+                                          labels = c(1,2,3,4))) 
+
+# Encode degree column (ordinal values)
+djsat$degree_encoded <- as.numeric(factor(djsat$degree, 
+                                          levels = c("Less than high school",
+                                                     "High school",
+                                                     "Associate/junior college",
+                                                     "Bachelor's",
+                                                     "Graduate"),
+                                          labels = c(1, 2, 3, 4, 5)))
+
+# One hot encode gender
+dummies_sex <- model.matrix(~ sex - 1, data = djsat)
+djsat <- cbind(djsat, dummies_sex)
+
+# One hot encode race
+# Create dummy variables for the 'race' column
+dummies_race <- model.matrix(~ race - 1, data = djsat)
+djsat <- cbind(djsat, dummies_race)
+
+```
+
+```{r}
+# Validate the updated dataframe
+#View(djsat)
+#print(nrow(djsat))
+
+```
+
+
+### Mean and Standard deviations
+```{r}
+# Mean and SD for the variables
+# Select the relevant numeric columns
+numeric_columns <- djsat[, c("satjob_encoded",
+                             "unempp",
+                             "inv_unempp",
+                             "year",
+                             "age",
+                             "sexMale",
+                             "incomemin",
+                             "raceWhite",
+                             "raceBlack",
+                             "degree_encoded")]
+
+# Calculate the mean and standard deviation for each numeric column
+mean_values <- sapply(numeric_columns, mean, na.rm = TRUE)
+sd_values <- sapply(numeric_columns, sd, na.rm = TRUE)
+
+# Round the mean and standard deviation values to two decimal places
+mean_values <- round(mean_values, 2) 
+sd_values <- round(sd_values, 2)
+
+# Combine the results into a dataframe for better readability
+summary_stats <- data.frame(Mean = mean_values, Standard_Deviation = sd_values)
+
+# Print the summary statistics
+options(max.print = 20)
+print(summary_stats)
+
+```
+
+### Correlation
+```{r}
+# Check Correlation
+# Select the relevant numeric columns
+numeric_columns <- djsat[, c("satjob_encoded",
+                             "unempp",
+                             "year",
+                             "age",
+                             "degree_encoded",
+                             "sexMale",
+                             "sexFemale",
+                             "raceWhite",
+                             "raceBlack",
+                             "raceOther",
+                             "incomemin")]
+
+
+# Calculate the correlation matrix for the selected numeric columns
+correlation_matrix <- cor(numeric_columns,
+                          use = "complete.obs",
+                          method = "pearson" )
+
+# Print the correlation matrix
+print(correlation_matrix)
+
+# Create the correlation plot with adjusted text size
+corrplot(correlation_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", 
+         tl.cex = 0.5, # text label size
+         number.cex = 0.5) # coefficient text size
+
+
+
+```
+
+### Correlation tests
+```{r}
+
+# List of variable names
+variables <- c("satjob_encoded",
+               "unempp",
+               "year",
+               "age",
+               "sexMale",
+               "incomemin")
+
+# Create an empty dataframe to store results
+results <- data.frame(
+  Variable1 = character(),
+  Variable2 = character(),
+  Pearson_Coefficient = numeric(),
+  t_Statistic = numeric(),
+  p_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through all combinations of variables
+for (i in 1:(length(variables) - 1)) {
+  for (j in (i + 1):length(variables)) {
+    var1 <- variables[i]
+    var2 <- variables[j]
+    
+    # Perform Pearson correlation test
+    cor_test <- rcorr(as.matrix(djsat[, c(var1, var2)]), type = "pearson")
+    
+    # Extract Pearson coefficient, t-statistic, and p-value
+    pearson_coeff <- cor_test$r[1, 2]
+    t_stat <- (pearson_coeff * sqrt(nrow(djsat) - 2)) / sqrt(1 - pearson_coeff^2)
+    p_value <- cor_test$P[1, 2]
+    
+    # Determine significance stars
+    significance <- ifelse(p_value < 0.001, "***",
+                           ifelse(p_value < 0.01, "**",
+                                  ifelse(p_value < 0.05, "*", "")))
+    
+    # Add results to the dataframe
+    results <- rbind(results, data.frame(
+      Variable1 = var1,
+      Variable2 = var2,
+      Pearson_Coefficient = pearson_coeff,
+      t_Statistic = t_stat,
+      p_Value = p_value,
+      Significance = significance
+    ))
+  }
+}
+
+# Print the results
+print(results)
+
+```
+
+
+### First model
+```{r}
+# Run the linear regression
+model <- lm(satjob_encoded ~ unempp + year, data = djsat)
+
+```
+
+### Summary of regresion model-1
+```{r}
+options(max.print = 10000)
+
+# Print the summary of the regression model
+summary(model)
+
+```
+
+
+### Cluster summary of regresion model-1 
+```{r}
+# Print the summary of the regression model
+clusterSE <- sandwich::vcovCL(model, cluster = djsat$year)
+lmtest::coeftest(model, vcov. = clusterSE)
+```
+
+### Heteroskedasticity test for model-1
+```{r}
+# Check for Heteroskedasticity model1
+hs_m1 <- bptest(model)
+hs_m1
+```
+
+
+### Visual test for heteroskedasticity: model-1
+```{r}
+plot(resid(model))
+plot(resid(model), djsat$year)
+```
+
+```{r}
+#plot( 1:nrow(djsat), resid(model),)
+plot( x = 1:nrow(djsat), y = resid(model))
+
+```
+
+
+### Multicoliniarity test model-1 
+```{r}
+mc_m1 <- vif(model)
+mc_m1
+
+```
+
+
+### Ramsey Regression Specification Error Test: model-1
+```{r}
+# Ramsey RESET test
+resettest(model, power = 2:3)
+```
+### Visual and statistical normality test: Model-1
+```{r}
+residuals <- residuals(model)
+hist(residuals)
+```
+
+### Anderson-Darling normality test: model-1
+```{r}
+ad.test(residuals)
+
+```
+### Anova variance test: model-1
+```{r}
+anova(model)
+```
+
+
+### Second model 
+```{r}
+# Build the second regression model with additional predictor variables
+model2 <- lm(satjob_encoded ~ unempp +
+                              year +
+                              age +
+                              I(age^2) +
+                              sexMale +
+                              log_incomemin,
+              data = djsat)
+
+```
+
+
+### Summary of regresion model-2
+```{r}
+options(max.print = 10000)
+# Print the summary of the regression model
+summary(model2)
+```
+
+
+### Cluster summary of model-2
+```{r}
+options(max.print = 10000)
+
+# Cluster summary
+clusterSE <- sandwich::vcovCL(model2, cluster = djsat$year)
+lmtest::coeftest(model2, vcov. = clusterSE)
+
+```
+
+
+### Heteroskedasticity test for model-2
+```{r}
+# Check for Heteroskedasticity model2
+hs_m2 <- bptest(model2)
+hs_m2
+```
+
+
+### Multicoliniarity test for model-2
+```{r}
+# Multicoliniarity model2
+alias(model2)
+```
+
+
+### Ramsey Regression Specification Error Test: model-2
+```{r}
+# Ramsey RESET test
+resettest(model2, power = 2:3)
+```
+
+### Visual and statistical normality test: Model-2
+```{r}
+residuals <- residuals(model2)
+hist(residuals)
+```
+
+### Anderson-Darling normality test: model-2
+```{r}
+ad.test(residuals)
+
+```
+### Anova variance test: model-2
+```{r}
+anova(model2)
+
+```
+
+
+### Rebulid model by removing outliers and Age variable (multicollinearity)
+```{r}
+
+# Remove outliers based on the IQR (inter quartile range)
+remove_iqr_outliers_age <- function(data, column_name) {
+  # Extract the numeric column (age)
+  age_data <- data[[column_name]]
+  
+  # Calculate Q1, Q3, and IQR
+  Q1 <- quantile(age_data, 0.25, na.rm = TRUE)
+  Q3 <- quantile(age_data, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  
+  # Calculate lower and upper bounds for outlier removal
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  
+  # Filter rows where "age" is within the IQR bounds
+  filtered_data <- data[age_data >= lower_bound & age_data <= upper_bound, ]
+  
+  return(filtered_data)
+}
+
+
+```
+
+
+### Rebuild model - model-2A
+```{r}
+
+# Apply the function to the "age" column
+djsat_filtered <- remove_iqr_outliers_age(djsat, "age")
+
+model2A <- lm(satjob_encoded ~ unempp +
+                              year +
+                              I(age^2) +
+                              sexMale +
+                              log_incomemin,
+              data = djsat_filtered)
+```
+
+
+### Summary of regression model-2A
+```{r}
+#options(max.print = 10000)
+
+# Summary
+summary(model2A)
+```
+
+### Clustered summary of regression model-2A
+```{r}
+options(max.print = 10000)
+
+# Cluster summary
+clusterSE <- sandwich::vcovCL(model2A, cluster = djsat_filtered$year)
+lmtest::coeftest(model2A, vcov. = clusterSE)
+
+```
+### Heteroskedasticity test for model-2A
+```{r}
+# Check for Heteroskedasticity model2A
+hs_m2a <- bptest(model2A)
+hs_m2a
+```
+### Multicoliniarity test for model-2A
+```{r}
+# Multicoliniarity test for model3
+  multicol2A <- vif(model2A)
+multicol2A
+```
+
+### Ramsey Regression Specification Error Test: model-2A
+```{r}
+# Ramsey RESET test
+resettest(model2A, power = 2:3)
+```
+
+
+### Anderson-Darling normality test: model-2A
+```{r}
+residuals <- residuals(model2A)
+ad.test(residuals)
+
+```
+### Anova variance test: model-2A
+```{r}
+anova(model2A)
+
+```
+
+### Third Model
+```{r}
+# Build the third regression model. Add race and education
+model3 <- lm(satjob_encoded ~ unempp +
+               sexMale +
+               age + 
+               I(age^2) +
+               year + 
+               log_incomemin +
+               raceBlack +
+               degree_encoded,
+              data = djsat)
+```
+
+
+### Summary of regression model-3
+```{r}
+options(max.print = 10000)
+# Print the summary of the regression model
+summary(model3)
+```
+
+
+### Cluster summary of model-3
+```{r}
+options(max.print = 10000)
+# Print the summary of the regression model
+clusterSE <- sandwich::vcovCL(model3, cluster = djsat$year)
+lmtest::coeftest(model3, vcov. = clusterSE)
+```
+
+
+### Heteroskedasticity test for model-3
+```{r}
+# Heteroskedasticity test for model3
+bptest(model3)
+```
+
+
+### Multicoliniarity test for model-3
+```{r}
+# Multicoliniarity test for model3
+  multicol3 <- vif(model3)
+multicol3
+```
+
+### Ramsey Regression Specification Error Test: model-3
+```{r}
+# Ramsey RESET test
+resettest(model3, power = 2:3)
+```
+### Visual and statistical normality test: Model-3
+```{r}
+residuals <- residuals(model3)
+hist(residuals)
+```
+
+
+### Anderson-Darling normality test: model-3
+```{r}
+ad.test(residuals)
+```
+
+### Anova variance test: model-3
+```{r}
+anova(model3)
+
+```
+
